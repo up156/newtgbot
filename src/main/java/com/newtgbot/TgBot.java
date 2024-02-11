@@ -4,15 +4,14 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
-import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.GetFile;
-import org.telegram.telegrambots.meta.api.methods.groupadministration.GetChat;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
-import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageReplyMarkup;
-import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
-import org.telegram.telegrambots.meta.api.objects.*;
+import org.telegram.telegrambots.meta.api.objects.File;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.api.objects.Message;
+import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
@@ -22,19 +21,23 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 @Slf4j
 public class TgBot extends TelegramLongPollingBot {
 
-    private static final String CHAT_ID = "";
+    static final String CHAT_ID = "";
     //id чата, где бот установлен админом
 
-    private static HashMap<Long, User> users;
+    public static HashMap<Long, User> users;
     private final WeatherStation weatherStation;
     private final NotionSender notionSender;
     private final Listener listener;
     private final Writer writer;
+
+    private final CallbackQueryWorker callbackQueryWorker;
+    @Getter
+    private final ProductWorker productWorker;
+
     private final static int INCOMING_LIMIT = 1000;
     @Getter
     @Setter
@@ -59,50 +62,33 @@ public class TgBot extends TelegramLongPollingBot {
         listener = new Listener();
         writer = new Writer();
         messages = new ArrayList<>();
+        productWorker = new ProductWorker(this);
+        callbackQueryWorker = new CallbackQueryWorker(this);
+
     }
 
     @Override
     public void onUpdateReceived(Update update) {
 
         if (update.hasCallbackQuery()) {
-            buttonTap(update);
+            callbackQueryWorker.buttonTap(update);
             return;
         }
 
-        var message = update.getMessage();
-        var user = message.getFrom();
-        Long id = user.getId();
-        String textFromAudio = "";
-        log.info(user.getFirstName() + " wrote " + message.getText());
+        logIncomingMessage(update);
+        Message message = update.getMessage();
 
-        if (users.get(id) == null) {
+        if (checkIfNewUser(message)) {
             getStarted(message);
             return;
         }
 
         if (update.getMessage().hasVoice()) {
-            try {
-                File file = execute(new GetFile(update.getMessage().getVoice().getFileId()));
-                java.io.File downloaded = downloadFile(file);
-
-                textFromAudio = listener.convertAudio(update, downloaded);
-                System.out.println(textFromAudio);
-                sendText(message.getChatId(), "Я слышу вот так: " + textFromAudio);
-
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-
-        } else if (message.getText().length() > INCOMING_LIMIT) {
-            sendText(message.getChatId(), "Слишком длинно.");
-            return;
+            update.getMessage().setText(workWithVoiceMessage(update));
         }
 
-        if (message.getText() == null) {
-            if (!textFromAudio.isEmpty()) {
-                update.getMessage().setText(textFromAudio);
-                workWithMessage(update);
-            }
+        else if (message.getText().length() > INCOMING_LIMIT) {
+            sendText(message.getChatId(), "Слишком длинно.");
             return;
         }
 
@@ -117,18 +103,47 @@ public class TgBot extends TelegramLongPollingBot {
         }
 
         if (message.getText().length() > 2) {
-            if (users.get(id).getIsAddingProducts()) {
-                addGoodsFromReadyText(message.getText());
+            if (users.get(message.getFrom().getId()).getIsAddingProducts()) {
+                productWorker.addGoodsFromReadyText(message.getText());
                 deleteIncomingMessage(message);
                 return;
             }
-            if (users.get(id).getIsAddingTask()) {
+            if (users.get(message.getFrom().getId()).getIsAddingTask()) {
                 notionSender.sendTask(message.getText());
                 deleteIncomingMessage(message);
                 return;
             }
             workWithMessage(update);
         }
+    }
+
+    private void logIncomingMessage(Update update) {
+
+        var message = update.getMessage();
+        var user = message.getFrom();
+
+        log.info(user.getFirstName() + " wrote " + message.getText());
+
+    }
+
+    private boolean checkIfNewUser(Message message) {
+        return (users.get(message.getFrom().getId()) == null);
+    }
+
+    private String workWithVoiceMessage(Update update) {
+        String textFromAudio = "";
+        try {
+            File file = execute(new GetFile(update.getMessage().getVoice().getFileId()));
+            java.io.File downloaded = downloadFile(file);
+
+            textFromAudio = listener.convertAudio(update, downloaded);
+            log.info(textFromAudio);
+            sendText(update.getMessage().getChatId(), "Я слышу вот так: " + textFromAudio);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return textFromAudio;
     }
 
     private void workWithMessage(Update update) {
@@ -138,7 +153,7 @@ public class TgBot extends TelegramLongPollingBot {
         User user = users.get(message.getFrom().getId());
 
         if (user.getIsAddingProducts()) {
-            addGoodsFromReadyText(text);
+            productWorker.addGoodsFromReadyText(text);
             deleteIncomingMessage(message);
             return;
         }
@@ -155,8 +170,8 @@ public class TgBot extends TelegramLongPollingBot {
 
         if (text.equals("список покупок")) {
             deleteIncomingMessage(message);
-            user.setProducts(new ArrayList<>(getCurrentProducts()));
-            sendMenu(message.getChatId(), "<b>Checklist: </b>", getKeyboard(user));
+            user.setProducts(new ArrayList<>(productWorker.getCurrentProducts()));
+            sendMenu(message.getChatId(), "<b>Checklist: </b>", callbackQueryWorker.getKeyboard(user));
             return;
         }
         if (text.equals("добавить")) {
@@ -167,7 +182,7 @@ public class TgBot extends TelegramLongPollingBot {
         }
 
         if (text.equals("удалить список")) {
-            removeAll();
+            productWorker.removeAll();
             getStarted(update.getMessage());
             return;
         }
@@ -196,74 +211,7 @@ public class TgBot extends TelegramLongPollingBot {
         this.getMessages().add(message);
     }
 
-    private HashSet<String> getCurrentProducts() {
-
-        HashSet<String> result = new HashSet<>();
-        try {
-            Chat chat = execute(new GetChat(CHAT_ID));
-            Message editMessage = chat.getPinnedMessage();
-            String currentMessage = editMessage.getText();
-            if (currentMessage.length() > 17) {
-                currentMessage = currentMessage.substring(currentMessage.indexOf("Список в магазин") + 19);
-                result.addAll(List.of(currentMessage.split(currentMessage.contains("\n") ? "\n" : ",")));
-            }
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
-        }
-        return result;
-    }
-
-
-    private void updateList(String text) {
-
-        if (text.length() < 2) {
-            return;
-        }
-        try {
-            Chat chat = execute(new GetChat(CHAT_ID));
-            Message editMessage = chat.getPinnedMessage();
-            String currentMessage = editMessage.getText();
-            EditMessageText editMessageText = EditMessageText.builder()
-                    .messageId(editMessage.getMessageId())
-                    .chatId(String.valueOf(editMessage.getChatId()))
-                    .text(currentMessage + "\r\n" + text)
-                    .build();
-            execute(editMessageText);
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void addGoodsFromReadyText(String temp) {
-        StringBuilder stringBuilder = new StringBuilder();
-        List<String> goods = new ArrayList<>(List.of(temp.split(temp.contains("\n") ? "\n" : ",")));
-        goods.forEach(g -> {
-            if (!g.isEmpty()) {
-                stringBuilder.append(g.trim()).append("\r\n");
-            }
-        });
-        updateList(stringBuilder.toString());
-    }
-
-    private void removeAll() {
-        try {
-            Chat chat = execute(new GetChat(CHAT_ID));
-            Message editMessage = chat.getPinnedMessage();
-            if (editMessage.getText().equals("Cписок в ленту:")) {
-                return;
-            }
-            EditMessageText editMessageText = EditMessageText.builder()
-                    .messageId(editMessage.getMessageId())
-                    .chatId(String.valueOf(editMessage.getChatId()))
-                    .text("Cписок в ленту:")
-                    .build();
-            execute(editMessageText);
-        } catch (TelegramApiException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private void deleteIncomingMessage(Message message) {
+    public void deleteIncomingMessage(Message message) {
         try {
             execute(new DeleteMessage(String.valueOf(message.getChatId()), message.getMessageId()));
         } catch (TelegramApiException e) {
@@ -289,18 +237,6 @@ public class TgBot extends TelegramLongPollingBot {
 
         try {
             execute(sm);
-        } catch (TelegramApiException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    public Message sendCustomKeyboard(Long who, String txt, ReplyKeyboardMarkup kb) {
-        SendMessage sm = SendMessage.builder().chatId(who.toString())
-                .parseMode("HTML").text(txt)
-                .replyMarkup(kb).build();
-
-        try {
-            return execute(sm);
         } catch (TelegramApiException e) {
             throw new RuntimeException(e);
         }
@@ -342,7 +278,19 @@ public class TgBot extends TelegramLongPollingBot {
         this.messages = new ArrayList<>();
     }
 
-    private ReplyKeyboardMarkup getStartedKeyboard() {
+    public Message sendCustomKeyboard(Long who, String txt, ReplyKeyboardMarkup kb) {
+        SendMessage sm = SendMessage.builder().chatId(who.toString())
+                .parseMode("HTML").text(txt)
+                .replyMarkup(kb).build();
+
+        try {
+            return execute(sm);
+        } catch (TelegramApiException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static ReplyKeyboardMarkup getStartedKeyboard() {
 
         var checklist = KeyboardButton.builder()
                 .text("чек-лист")
@@ -396,115 +344,6 @@ public class TgBot extends TelegramLongPollingBot {
         return InlineKeyboardMarkup.builder()
                 .keyboardRow(list)
                 .build();
-    }
-
-    private InlineKeyboardMarkup getKeyboard(User user) {
-
-        var isDone = InlineKeyboardButton.builder()
-                .text("готово").callbackData("готово")
-                .build();
-
-        InlineKeyboardMarkup resultKeyboard = InlineKeyboardMarkup.builder()
-                .keyboard(getButtons(user))
-                .keyboardRow(List.of(isDone)).build();
-        return resultKeyboard;
-    }
-
-    private List<List<InlineKeyboardButton>> getButtons(User user) {
-        List<InlineKeyboardButton> listForCheck = user.getIsWorkingWithFirstPart() ?
-                Products.getFirstHalf() : Products.getSecondHalf();
-        var arrowButton = InlineKeyboardButton.builder()
-                .text(user.getIsWorkingWithFirstPart() ? "->" : "<-")
-                .callbackData(user.getIsWorkingWithFirstPart() ? "->" : "<-")
-                .build();
-
-        List<InlineKeyboardButton> result = new ArrayList<>(List.of());
-        List<String> goods = user.getProducts();
-
-        for (InlineKeyboardButton button : listForCheck) {
-            if (!goods.contains(button.getText())) {
-                result.add(button);
-            }
-        }
-
-        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
-        List<InlineKeyboardButton> temp = new ArrayList<>();
-        for (int i = 0; i < result.size(); i++) {
-            if (i % 3 == 2) {
-                keyboard.add(temp);
-                temp = new ArrayList<>();
-            }
-            temp.add(result.get(i));
-        }
-        keyboard.add(temp);
-        keyboard.add(List.of(arrowButton));
-        return keyboard;
-    }
-
-    private void onQueryFinal(Update update) {
-
-        User user = users.get(update.getCallbackQuery().getFrom().getId());
-        Message lastMessage = update.getCallbackQuery().getMessage();
-        deleteIncomingMessage(user.getLastMessage());
-        user.setLastMessage(sendCustomKeyboard(
-                lastMessage.getChatId(), " <b>Выбирай, что нужно сделать.</b> ", getStartedKeyboard()));
-        try {
-            Thread.sleep(500);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-        deleteIncomingMessage(lastMessage);
-    }
-
-    private void buttonTap(Update update) {
-        try {
-            Message message = update.getCallbackQuery().getMessage();
-            Long chatId = message.getChatId();
-            int messageId = message.getMessageId();
-            String data = update.getCallbackQuery().getData();
-            User user = users.get(update.getCallbackQuery().getFrom().getId());
-
-            EditMessageReplyMarkup newKb = EditMessageReplyMarkup.builder()
-                    .chatId(String.valueOf(chatId)).messageId(messageId).build();
-            if (data.equals("/cancel")) {
-                if (user.getIsAddingProducts()) {
-                    user.setIsAddingProducts(false);
-                    onQueryFinal(update);
-                    return;
-                }
-                user.setIsAddingTask(false);
-                onQueryFinal(update);
-                return;
-            }
-
-            if (data.equals("готово")) {
-
-                StringBuilder stringBuilder = new StringBuilder();
-                for (String s : user.getProducts()) {
-                    if (!(getCurrentProducts().contains(s) || getCurrentProducts().contains(s.toLowerCase()))) {
-                        stringBuilder.append(s).append("\r\n");
-                    }
-                }
-                updateList(stringBuilder.toString());
-                sendText(chatId, "Отлично");
-                onQueryFinal(update);
-                return;
-            }
-            if (data.equals("->") || data.equals("<-")) {
-                user.setIsWorkingWithFirstPart(!data.equals("->"));
-            } else {
-                List<String> products = user.getProducts();
-                products.add(data);
-                user.setProducts(products);
-            }
-            newKb.setReplyMarkup(getKeyboard(user));
-            AnswerCallbackQuery close = AnswerCallbackQuery.builder()
-                    .callbackQueryId(update.getCallbackQuery().getId()).build();
-            execute(close);
-            execute(newKb);
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
-        }
     }
 
 }
